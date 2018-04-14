@@ -11,8 +11,11 @@ import org.infinispan.client.hotrod.event.ClientCacheEntryCustomEvent;
 import org.infinispan.commons.util.KeyValueWithPrevious;
 
 
-@ClientListener(converterFactoryName = "key-value-with-previous-converter-factory")
+@ClientListener(converterFactoryName = "key-value-with-previous-converter-factory",
+    filterFactoryName = "site-filter-factory"
+)
 public class RemoteCacheListener {
+
     private final Vertx vertx;
     private final String address;
 
