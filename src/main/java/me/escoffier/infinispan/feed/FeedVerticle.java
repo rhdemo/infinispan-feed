@@ -153,6 +153,7 @@ public class FeedVerticle extends AbstractVerticle {
                                 vertx.rxExecuteBlocking(
                                     fut -> {
                                         cache.removeClientListener(listener);
+                                        cleaners.remove(triggerName);
                                         fut.complete();
                                     })
                                     .toCompletable()
