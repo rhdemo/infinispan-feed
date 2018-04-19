@@ -3,6 +3,7 @@ package me.escoffier.infinispan.feed;
 import io.reactivex.Completable;
 import io.reactivex.Single;
 import io.vertx.core.Future;
+import io.vertx.core.json.Json;
 import io.vertx.core.json.JsonObject;
 import io.vertx.ext.web.client.WebClientOptions;
 import io.vertx.reactivex.CompletableHelper;
@@ -37,6 +38,8 @@ public class FeedVerticle extends AbstractVerticle {
 
     private Map<String, Supplier<Completable>> cleaners = new HashMap<>();
 
+    private Map<String, String> listeners = new HashMap<>();
+
     @Override
     public void start(Future<Void> fut) {
         Router router = Router.router(vertx);
@@ -44,6 +47,9 @@ public class FeedVerticle extends AbstractVerticle {
         router.post().handler(BodyHandler.create());
         router.post("/api/feed/listener").handler(this::registerListener);
         router.delete("/api/feed/listener/:encoded").handler(this::unregisterListener);
+
+        router.get("/listeners").handler(this::list);
+
         router.get("/health").handler(rc -> rc.response().end("OK"));
         router.route().handler(rc -> {
             LOGGER.info("Invoked on {} {} with body {}", rc.request().method(), rc.request().path(), rc.getBody());
@@ -56,6 +62,10 @@ public class FeedVerticle extends AbstractVerticle {
             .toCompletable()
             .subscribe(CompletableHelper.toObserver(fut));
 
+    }
+
+    private void list(RoutingContext rc) {
+        rc.response().end(Json.encodePrettily(listeners));
     }
 
     private void unregisterListener(RoutingContext rc) {
@@ -79,7 +89,7 @@ public class FeedVerticle extends AbstractVerticle {
         String cache = json.getString("cache_name", "default");
 
         String triggerName = rc.getBodyAsJson().getString("triggerName");
-        if (cleaners.containsKey(triggerName)) {
+        if (listeners.containsKey(triggerName)) {
             rc.response()
                 .setStatusCode(400)
                 .end(new JsonObject().put("message", "Trigger " + triggerName + " already registered").encode());
@@ -91,7 +101,8 @@ public class FeedVerticle extends AbstractVerticle {
             .doOnSuccess(c -> LOGGER.info("Cache has been retrieved: {}", c.getName()))
             .flatMapCompletable(c -> registerListener(c, json))
             .subscribe(
-                () -> rc.response().end(new JsonObject().put("message", "listener registered for trigger: " + triggerName).encode()),
+                () -> rc.response().end(new JsonObject().put("message", "listener registered for trigger: " + triggerName)
+                    .encode()),
                 rc::fail
             );
     }
@@ -150,8 +161,10 @@ public class FeedVerticle extends AbstractVerticle {
                     Supplier<Completable> cleaner = () ->
                         consumer.rxUnregister()
                             .andThen(
+
                                 vertx.rxExecuteBlocking(
                                     fut -> {
+                                        listeners.remove(triggerName);
                                         cache.removeClientListener(listener);
                                         cleaners.remove(triggerName);
                                         fut.complete();
@@ -161,6 +174,7 @@ public class FeedVerticle extends AbstractVerticle {
                             );
 
                     cleaners.put(triggerName, cleaner);
+                    listeners.put(triggerName, cache.getName());
                     cache.addClientListener(listener);
                     LOGGER.info("Registering listener for trigger {}, ({})", triggerName, cleaners.keySet());
                     future.complete();
