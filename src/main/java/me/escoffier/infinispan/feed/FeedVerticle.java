@@ -8,6 +8,7 @@ import io.vertx.core.json.JsonObject;
 import io.vertx.ext.web.client.WebClientOptions;
 import io.vertx.reactivex.CompletableHelper;
 import io.vertx.reactivex.core.AbstractVerticle;
+import io.vertx.reactivex.core.eventbus.Message;
 import io.vertx.reactivex.core.eventbus.MessageConsumer;
 import io.vertx.reactivex.ext.web.Router;
 import io.vertx.reactivex.ext.web.RoutingContext;
@@ -128,58 +129,58 @@ public class FeedVerticle extends AbstractVerticle {
     private Completable registerListener(RemoteCache cache, JsonObject json) {
         String auth = json.getString("authKey");
         String triggerName = json.getString("triggerName");
-
+        String uri = OPENWHISK_ROOT + OPENWHISK_TRIGGER_API_PATH + extractTriggerName(triggerName);
+        
         MessageConsumer<JsonObject> consumer = vertx.eventBus().consumer(cache.getName());
-        consumer.handler(message -> {
-            String key = message.body().getString("key");
-            String value = message.body().getString("value");
-            String event = message.body().getString("event");
-            JsonObject body = new JsonObject();
-            body.put("timestamp", System.currentTimeMillis())
-                .put("eventType", event)
-                .put("value", value)
-                .put("key", key);
+        consumer.toObservable()
+            .map(Message::body)
+            .distinctUntilChanged()
+            .map(body -> {
+                    String key = body.getString("key");
+                    String value = body.getString("value");
+                    String event = body.getString("event");
+                    JsonObject payload = new JsonObject();
+                    return payload.put("timestamp", System.currentTimeMillis())
+                        .put("eventType", event)
+                        .put("value", value)
+                        .put("key", key);
+                }
+            )
+            .flatMapSingle(payload -> {
+                LOGGER.info("{} is posting to {} : {}", this, uri, payload.encode());
+                return client.postAbs(uri)
+                    .putHeader("Authorization", "Basic " + encode(auth))
+                    .putHeader("Accept", "application/json")
+                    .rxSendJsonObject(payload);
+            })
+            .doOnNext(resp ->
+                LOGGER.info("{} got result from trigger: {} {}", this, resp.statusCode(), resp.bodyAsString()))
+            .subscribe();
 
-            String uri = OPENWHISK_ROOT + OPENWHISK_TRIGGER_API_PATH + extractTriggerName(triggerName);
+        return consumer.rxCompletionHandler()
+            .andThen(vertx.rxExecuteBlocking(future -> {
+                RemoteCacheListener listener = new RemoteCacheListener(vertx, cache);
 
-            LOGGER.info("Posting to {} : {}", uri, body.encode());
-            client.postAbs(uri)
-                .putHeader("Authorization", "Basic " + encode(auth))
-                .putHeader("Accept", "application/json")
-                .rxSendJsonObject(body)
-                .doOnSuccess(resp ->
-                    LOGGER.info("Got result from trigger: {} {}", resp.statusCode(), resp.bodyAsString()))
-                .subscribe();
-        });
+                Supplier<Completable> cleaner = () ->
+                    consumer.rxUnregister()
+                        .andThen(
+                            vertx.rxExecuteBlocking(
+                                fut -> {
+                                    listeners.remove(triggerName);
+                                    cache.removeClientListener(listener);
+                                    cleaners.remove(triggerName);
+                                    fut.complete();
+                                })
+                                .toCompletable()
+                                .onErrorResumeNext(t -> Completable.complete())
+                        );
 
-        return consumer
-            .rxCompletionHandler()
-            .andThen(
-                vertx.rxExecuteBlocking(future -> {
-                    RemoteCacheListener listener = new RemoteCacheListener(vertx, cache);
-
-                    Supplier<Completable> cleaner = () ->
-                        consumer.rxUnregister()
-                            .andThen(
-
-                                vertx.rxExecuteBlocking(
-                                    fut -> {
-                                        listeners.remove(triggerName);
-                                        cache.removeClientListener(listener);
-                                        cleaners.remove(triggerName);
-                                        fut.complete();
-                                    })
-                                    .toCompletable()
-                                    .onErrorResumeNext(t -> Completable.complete())
-                            );
-
-                    cleaners.put(triggerName, cleaner);
-                    listeners.put(triggerName, cache.getName());
-                    cache.addClientListener(listener);
-                    LOGGER.info("Registering listener for trigger {}, ({})", triggerName, cleaners.keySet());
-                    future.complete();
-                })
-                    .toCompletable());
+                cleaners.put(triggerName, cleaner);
+                listeners.put(triggerName, cache.getName());
+                cache.addClientListener(listener);
+                LOGGER.info("Registering listener for trigger {}, ({})", triggerName, cleaners.keySet());
+                future.complete();
+            }).toCompletable());
     }
 
 
