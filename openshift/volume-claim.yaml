@@ -1,0 +1,11 @@
+http://score-gateway-scavenger-hunt-microservice.apps.summit-gce.sysdeseng.com/leaderboardapiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  annotations:
+  name: feed-provider-volume-claim
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 100Mi

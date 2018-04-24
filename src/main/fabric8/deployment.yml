@@ -1,0 +1,12 @@
+spec:
+  template:
+    spec:
+      volumes:
+        - name: feed-provider-volume
+          persistentVolumeClaim:
+            claimName: feed-provider-volume-claim
+      containers:
+        - name: vertx
+          volumeMounts:
+            - mountPath: /data
+              name: feed-provider-volume

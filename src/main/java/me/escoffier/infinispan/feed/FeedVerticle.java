@@ -3,7 +3,7 @@ package me.escoffier.infinispan.feed;
 import io.reactivex.Completable;
 import io.reactivex.Single;
 import io.vertx.core.Future;
-import io.vertx.core.json.Json;
+import io.vertx.core.json.JsonArray;
 import io.vertx.core.json.JsonObject;
 import io.vertx.ext.web.client.WebClientOptions;
 import io.vertx.reactivex.CompletableHelper;
@@ -14,6 +14,7 @@ import io.vertx.reactivex.ext.web.Router;
 import io.vertx.reactivex.ext.web.RoutingContext;
 import io.vertx.reactivex.ext.web.client.WebClient;
 import io.vertx.reactivex.ext.web.handler.BodyHandler;
+import me.escoffier.infinispan.feed.persistence.PersistenceService;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.infinispan.client.hotrod.RemoteCache;
@@ -37,12 +38,12 @@ public class FeedVerticle extends AbstractVerticle {
 
     private WebClient client;
 
+    private PersistenceService service;
     private Map<String, Supplier<Completable>> cleaners = new HashMap<>();
-
-    private Map<String, String> listeners = new HashMap<>();
 
     @Override
     public void start(Future<Void> fut) {
+        service = PersistenceService.file(vertx, "/data");
         Router router = Router.router(vertx);
         client = WebClient.create(vertx, new WebClientOptions().setSsl(true).setTrustAll(true));
         router.post().handler(BodyHandler.create());
@@ -57,56 +58,86 @@ public class FeedVerticle extends AbstractVerticle {
             rc.response().end("{}");
         });
 
-        vertx.createHttpServer()
-            .requestHandler(router::accept)
-            .rxListen(8080)
-            .toCompletable()
+
+        Completable reload = service.all()
+            .flatMapCompletable(json -> {
+                LOGGER.info("Reloading trigger from " + json.encode());
+                return register(json);
+            })
+            .doOnComplete(() -> LOGGER.info("{} listeners reloaded", cleaners.size()));
+
+        reload
+            .andThen(vertx.createHttpServer()
+                .requestHandler(router::accept)
+                .rxListen(8080)
+                .toCompletable()
+            )
             .subscribe(CompletableHelper.toObserver(fut));
 
     }
 
     private void list(RoutingContext rc) {
-        rc.response().end(Json.encodePrettily(listeners));
+        service.all().toList().map(list -> list.stream().collect(JsonArray::new, JsonArray::add, JsonArray::addAll))
+            .subscribe(
+                array -> rc.response().end(array.encodePrettily()),
+                rc::fail);
     }
 
     private void unregisterListener(RoutingContext rc) {
         String triggerName = decode(rc.pathParam("encoded"));
-        Supplier<Completable> supplier = cleaners.remove(triggerName);
-        if (supplier == null) {
-            rc.response().end(new JsonObject().put("message", "trigger not found: " + triggerName + " / " + cleaners.keySet())
-                .encode());
-        } else {
-            LOGGER.info("Un-registering trigger {}" + triggerName);
-            supplier.get().subscribe(
+        service.get(triggerName)
+            .switchIfEmpty(Single.error(new Exception("trigger not found " + triggerName)))
+            .flatMapCompletable(json -> {
+                LOGGER.info("Un-registering trigger {}" + triggerName);
+                return cleanup(triggerName);
+            })
+            .subscribe(
                 () -> rc.response().end(new JsonObject().put("message", "trigger " + triggerName + " removed").encode()),
-                rc::fail
+                err -> rc.response().setStatusCode(400).end(new JsonObject().put("message", err.getMessage()).encode())
             );
-        }
     }
 
     private void registerListener(RoutingContext rc) {
         JsonObject json = rc.getBodyAsJson();
         LOGGER.info("Register listener called with " + json.encode());
-        String cache = json.getString("cache_name", "default");
 
         String triggerName = rc.getBodyAsJson().getString("triggerName");
-        if (listeners.containsKey(triggerName)) {
-            rc.response()
-                .setStatusCode(400)
-                .end(new JsonObject().put("message", "Trigger " + triggerName + " already registered").encode());
-            return;
-        }
 
-        getRemoteCacheManager(json.getString("hotrod_server_host"), json.getInteger("hotrod_port", 11222))
-            .flatMap(rcm -> retrieveCache(rcm, cache))
-            .doOnSuccess(c -> LOGGER.info("Cache has been retrieved: {}", c.getName()))
-            .flatMapCompletable(c -> registerListener(c, json))
+        service.get(triggerName)
+            .doOnSuccess(x -> {
+                throw new Exception("Trigger " + triggerName + " already registered");
+            })
+            .switchIfEmpty(register(json).toSingleDefault(json))
             .subscribe(
-                () -> rc.response().end(new JsonObject().put("message", "listener registered for trigger: " + triggerName)
-                    .encode()),
-                rc::fail
+                j -> rc.response()
+                    .end(new JsonObject().put("message", "listener registered for trigger: " + triggerName).encode()),
+                err -> rc.response()
+                    .setStatusCode(400)
+                    .end(new JsonObject().put("message", err.getMessage()).encode())
             );
     }
+
+    private Completable cleanup(String triggerName) {
+        Supplier<Completable> supplier = cleaners.remove(triggerName);
+        if (supplier == null) {
+            return Completable.error(new RuntimeException("Cannot find the cleaner for " + triggerName));
+        }
+        return service.delete(triggerName)
+            .doOnComplete(() -> LOGGER.info("Document deleted: {}", triggerName))
+            .andThen(supplier.get());
+    }
+
+
+    private Completable register(JsonObject json) {
+        String host = json.getString("hotrod_server_host");
+        Integer port = json.getInteger("hotrod_port", 11222);
+        String cache = json.getString("cache_name", "default");
+        return getRemoteCacheManager(host, port)
+            .flatMap(rcm -> retrieveCache(rcm, cache))
+            .doOnSuccess(c -> LOGGER.info("Cache has been retrieved: {}", c.getName()))
+            .flatMapCompletable(rc -> setupListener(rc, json));
+    }
+
 
     private Single<RemoteCache> retrieveCache(RemoteCacheManager rcm, String cache) {
         return vertx.rxExecuteBlocking(future -> future.complete(rcm.getCache(cache)));
@@ -126,11 +157,11 @@ public class FeedVerticle extends AbstractVerticle {
         );
     }
 
-    private Completable registerListener(RemoteCache cache, JsonObject json) {
+    private Completable setupListener(RemoteCache cache, JsonObject json) {
         String auth = json.getString("authKey");
         String triggerName = json.getString("triggerName");
         String uri = OPENWHISK_ROOT + OPENWHISK_TRIGGER_API_PATH + extractTriggerName(triggerName);
-        
+
         MessageConsumer<JsonObject> consumer = vertx.eventBus().consumer(cache.getName());
         consumer.toObservable()
             .map(Message::body)
@@ -157,7 +188,8 @@ public class FeedVerticle extends AbstractVerticle {
                 LOGGER.info("{} got result from trigger: {} {}", this, resp.statusCode(), resp.bodyAsString()))
             .subscribe();
 
-        return consumer.rxCompletionHandler()
+        return consumer
+            .rxCompletionHandler()
             .andThen(vertx.rxExecuteBlocking(future -> {
                 RemoteCacheListener listener = new RemoteCacheListener(vertx, cache);
 
@@ -166,21 +198,21 @@ public class FeedVerticle extends AbstractVerticle {
                         .andThen(
                             vertx.rxExecuteBlocking(
                                 fut -> {
-                                    listeners.remove(triggerName);
                                     cache.removeClientListener(listener);
-                                    cleaners.remove(triggerName);
                                     fut.complete();
                                 })
                                 .toCompletable()
                                 .onErrorResumeNext(t -> Completable.complete())
                         );
-
                 cleaners.put(triggerName, cleaner);
-                listeners.put(triggerName, cache.getName());
+                
                 cache.addClientListener(listener);
-                LOGGER.info("Registering listener for trigger {}, ({})", triggerName, cleaners.keySet());
+                LOGGER.info("Registering client listener for trigger {}, ({})", triggerName, cleaners.keySet());
+
                 future.complete();
-            }).toCompletable());
+            })
+            .flatMapCompletable(x -> service.save(triggerName, json))
+            .doOnComplete(() -> LOGGER.info("Document saved: {}", triggerName)));
     }
 
 

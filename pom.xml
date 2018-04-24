@@ -18,6 +18,7 @@
     <fabric8.generator.from>registry.access.redhat.com/redhat-openjdk-18/openjdk18-openshift:1.2</fabric8.generator.from>
     <fabric8.openshift.trimImageInContainerSpec>true</fabric8.openshift.trimImageInContainerSpec>
     <fabric8.skip.build.pom>true</fabric8.skip.build.pom>
+    <fabric8.recreate>true</fabric8.recreate>
 
     <vertx.health>/health</vertx.health>
   </properties>
@@ -83,6 +84,12 @@
       <groupId>junit</groupId>
       <artifactId>junit</artifactId>
       <version>4.12</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.assertj</groupId>
+      <artifactId>assertj-core</artifactId>
+      <version>3.9.1</version>
       <scope>test</scope>
     </dependency>
   </dependencies>
