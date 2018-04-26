@@ -23,6 +23,8 @@ import org.infinispan.client.hotrod.configuration.ConfigurationBuilder;
 
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Supplier;
 
 import static me.escoffier.infinispan.feed.Utils.*;
@@ -40,6 +42,7 @@ public class FeedVerticle extends AbstractVerticle {
 
     private PersistenceService service;
     private Map<String, Supplier<Completable>> cleaners = new HashMap<>();
+    private Map<String, Supplier<Completable>> checks = new HashMap<>();
 
     @Override
     public void start(Future<Void> fut) {
@@ -52,7 +55,34 @@ public class FeedVerticle extends AbstractVerticle {
 
         router.get("/listeners").handler(this::list);
 
-        router.get("/health").handler(rc -> rc.response().end("OK"));
+        router.get("/health").handler(rc -> {
+            if (checks.isEmpty()) {
+                rc.response().end("OK - no listener registered");
+            } else {
+                AtomicBoolean failureDetected = new AtomicBoolean();
+                AtomicInteger count = new AtomicInteger();
+                StringBuffer sb = new StringBuffer();
+                checks.forEach((name, check) ->
+                    check.get()
+                        .doFinally(() -> {
+                            int c = count.incrementAndGet();
+                            if (c == checks.size()) {
+                                if (failureDetected.get()) {
+                                    rc.response().setStatusCode(503).end(sb.toString());
+                                } else {
+                                    rc.response().setStatusCode(200).end(sb.toString());
+                                }
+                            }
+                        })
+                        .subscribe(
+                            () -> sb.append(name).append(" OK \n"),
+                            err -> {
+                                sb.append(name).append(" KO - ").append(err.getMessage()).append("\n");
+                                failureDetected.set(true);
+                            }
+                        ));
+            }
+        });
         router.route().handler(rc -> {
             LOGGER.info("Invoked on {} {} with body {}", rc.request().method(), rc.request().path(), rc.getBody());
             rc.response().end("{}");
@@ -119,6 +149,7 @@ public class FeedVerticle extends AbstractVerticle {
 
     private Completable cleanup(String triggerName) {
         Supplier<Completable> supplier = cleaners.remove(triggerName);
+        checks.remove(triggerName);
         if (supplier == null) {
             return Completable.error(new RuntimeException("Cannot find the cleaner for " + triggerName));
         }
@@ -192,7 +223,6 @@ public class FeedVerticle extends AbstractVerticle {
             .rxCompletionHandler()
             .andThen(vertx.rxExecuteBlocking(future -> {
                 RemoteCacheListener listener = new RemoteCacheListener(vertx, cache);
-
                 Supplier<Completable> cleaner = () ->
                     consumer.rxUnregister()
                         .andThen(
@@ -205,14 +235,20 @@ public class FeedVerticle extends AbstractVerticle {
                                 .onErrorResumeNext(t -> Completable.complete())
                         );
                 cleaners.put(triggerName, cleaner);
-                
+                checks.put(triggerName, () ->
+                    vertx.rxExecuteBlocking(fut -> {
+                        cache.size();
+                        fut.complete();
+                    }).toCompletable()
+                );
+
                 cache.addClientListener(listener);
                 LOGGER.info("Registering client listener for trigger {}, ({})", triggerName, cleaners.keySet());
 
                 future.complete();
             })
-            .flatMapCompletable(x -> service.save(triggerName, json))
-            .doOnComplete(() -> LOGGER.info("Document saved: {}", triggerName)));
+                .flatMapCompletable(x -> service.save(triggerName, json))
+                .doOnComplete(() -> LOGGER.info("Document saved: {}", triggerName)));
     }
 
 
